@@ -391,3 +391,18 @@ p code {
   color: #b45309;
   border: 1px solid #f5d49b;
 }
+
+/* ============ 单阀异常观测点规划 ============ */
+.hyp-list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.hyp-list li {
+  margin: 2px 0;
+}
+
+th.recommended-col,
+td.recommended-col {
+  background: #f3eefc;
+}

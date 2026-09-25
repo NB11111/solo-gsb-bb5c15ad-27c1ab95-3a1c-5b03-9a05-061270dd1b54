@@ -63,3 +63,16 @@ export const SAMPLE_WET_NODES: string[] = ['咖啡厅', '卫生间'];
  * 登记状态中展厅B 经 V08 供水（应为有水），现场却无水 → 可定位为 V08 实际已关。
  */
 export const SAMPLE_DRY_NODES: string[] = ['展厅B'];
+
+/**
+ * 示例单阀异常观测点规划：候选观测节点。
+ * 单翻 V01~V06 时环上分支签名一致（不可区分组），展厅B 可辨 V08、卫生间可辨 V07，
+ * 最少观测点 {卫生间、展厅B} 即可区分全部三组。
+ */
+export const SAMPLE_OBSERVER_CANDIDATES: string[] = [
+  '展厅A',
+  '展厅B',
+  '咖啡厅',
+  '卫生间',
+  '设备间',
+];

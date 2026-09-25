@@ -704,5 +704,150 @@ const beforeAnom = JSON.stringify(network);
 solver.locateValveAnomalies(network, { supplies: ['S1', 'S2'], wetNodes: ['C'], dryNodes: ['B'] });
 check('异常定位不修改输入网络', JSON.stringify(network) === beforeAnom);
 
+// ============ 单阀异常观测点规划 ============
+console.log('单阀异常观测点规划：');
+
+// 登记状态下（测试主网络）：单翻 V08 → B 无水；单翻 V07 → D 无水；其余单翻不改变
+// B/D 的有水状态（V01/V02/V09 等不在其唯一通路上）。
+// 候选 [A,B,C,D]：
+//   组1（baseline + V01..V06,V09）签名 [1,1,1,1]
+//   组2（V07）                       [1,1,1,0]
+//   组3（V08）                       [1,0,1,1]
+const o1 = solver.planSingleValveObservers(network, { supplies: ['S1', 'S2'], candidates: ['A', 'B', 'C', 'D'] });
+check('规划返回 ok', o1.status === 'ok');
+check('假设总数 = 阀门数 9 + 1', o1.hypothesisCount === 10 && o1.valveCount === 9);
+check('候选节点按名称升序', o1.candidates.join(',') === 'A,B,C,D');
+check('归为 3 个不可区分组', o1.groups.length === 3);
+check('可区分且最少观测点数为 2', o1.distinguishable === true && o1.pointCount === 2);
+check('推荐观测点 [B,D]（按节点名称升序列表）', o1.recommendedPoints.join(',') === 'B,D');
+const og1 = o1.groups[0];
+check('第 1 组含登记状态（排在首位）', og1.hypotheses[0].kind === 'baseline' && og1.hypotheses.length === 8);
+check('第 1 组含 V01、V09（环路单翻不改变签名）',
+  og1.hypotheses.some((h) => h.flippedValve === 'V01') && og1.hypotheses.some((h) => h.flippedValve === 'V09'));
+check('第 2 组仅 V07（D 无水）', o1.groups[1].hypotheses.length === 1 && o1.groups[1].hypotheses[0].flippedValve === 'V07');
+check('第 3 组仅 V08（B 无水）', o1.groups[2].hypotheses.length === 1 && o1.groups[2].hypotheses[0].flippedValve === 'V08');
+// 各组在推荐点 [B,D] 上的预期状态
+check('组1 在推荐点预期 有水/有水', o1.groups[0].expectedStates.join(',') === 'true,true');
+check('组2 在推荐点预期 有水/无水', o1.groups[1].expectedStates.join(',') === 'true,false');
+check('组3 在推荐点预期 无水/有水', o1.groups[2].expectedStates.join(',') === 'false,true');
+// 完整签名
+check('组2 完整签名 [A有水,B有水,C有水,D无水]', o1.groups[1].signature.join(',') === 'true,true,true,false');
+check('组3 完整签名 [A有水,B无水,C有水,D有水]', o1.groups[2].signature.join(',') === 'true,false,true,true');
+
+console.log('观测点规划：单点即可区分（且剔除恒湿的冗余候选）：');
+// S—V1—M，M 经并行的 V2/V3 接 O；候选 [O, S]（S 是供水点，恒有水、无区分力）。
+// baseline / 翻 V2 / 翻 V3：O 有水；翻 V1：O 无水 → 2 组；单点 O 即可区分
+const obsRedundantNet = {
+  nodes: ['S', 'M', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'M', open: true },
+    { id: 'V2', from: 'M', to: 'O', open: true },
+    { id: 'V3', from: 'M', to: 'O', open: true },
+  ],
+};
+const o2 = solver.planSingleValveObservers(obsRedundantNet, { supplies: ['S'], candidates: ['O', 'S'] });
+check('4 个假设归为 2 组', o2.status === 'ok' && o2.groups.length === 2 && o2.hypothesisCount === 4);
+check('恒湿的供水点 S 不入推荐，单点 O 即可区分', o2.pointCount === 1 && o2.recommendedPoints.join(',') === 'O');
+check('大组含 baseline、V2、V3（并行阀单翻不影响 O）',
+  o2.groups[0].hypotheses.length === 3 &&
+  o2.groups[0].hypotheses.some((h) => h.kind === 'baseline') &&
+  o2.groups[0].hypotheses.some((h) => h.flippedValve === 'V2'));
+check('小组仅 V1（O 无水）', o2.groups[1].hypotheses.length === 1 &&
+  o2.groups[1].hypotheses[0].flippedValve === 'V1');
+
+console.log('观测点规划：同数按节点名称升序列表字典序：');
+// S—V1—M—V2—N，X、Y 经无阀管段并接在 N 后：
+// 翻 V1 或 V2 都使 X、Y 同时无水（同组），baseline 两点均有水；
+// X 与 Y 单点均可区分两组，同数时字典序推荐 [X]
+const tieObsNet = {
+  nodes: ['S', 'M', 'N', 'X', 'Y'],
+  pipes: [
+    { id: 'P1', from: 'N', to: 'X' },
+    { id: 'P2', from: 'N', to: 'Y' },
+  ],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'M', open: true },
+    { id: 'V2', from: 'M', to: 'N', open: true },
+  ],
+};
+const o3 = solver.planSingleValveObservers(tieObsNet, { supplies: ['S'], candidates: ['X', 'Y'] });
+check('baseline 一组、V1/V2 同组（共 2 组）', o3.groups.length === 2 &&
+  o3.groups[0].hypotheses.length === 1 && o3.groups[1].hypotheses.length === 2);
+check('同数单点取名称升序 [X]', o3.pointCount === 1 && o3.recommendedPoints.join(',') === 'X');
+check('两组在 X 点预期 有水 / 无水', o3.groups[0].expectedStates[0] === true &&
+  o3.groups[1].expectedStates[0] === false);
+
+console.log('观测点规划：全部假设同组时无法区分：');
+// 两个仅经阀门的串联分支在任何单阀翻转下候选点状态一致：
+// 环网 S—V1—A—V2—S 与挂点 O 经 V3 接 A；只选 A 为候选时 baseline/V1/V2 均有水（V3 不翻），
+// 翻转 V3 使 A 仍有水——故需要构造：候选节点恒有水（供水点）→ 所有签名相同
+const sameObsNet = {
+  nodes: ['S', 'O'],
+  pipes: [],
+  valvedPipes: [{ id: 'V1', from: 'S', to: 'O', open: true }],
+};
+const o4 = solver.planSingleValveObservers(sameObsNet, { supplies: ['S'], candidates: ['S'] });
+check('全部假设同组：标记不可区分', o4.status === 'ok' && o4.distinguishable === false && o4.groups.length === 1);
+check('不可区分时无推荐点', o4.recommendedPoints === null && o4.pointCount === 0);
+check('同组包含登记状态与 V1 两个假设', o4.groups[0].hypotheses.length === 2);
+
+console.log('观测点规划：已关阀单独翻转为开也作为假设：');
+// S—V1(开)—X—V2(关)—O：baseline 时 X 有水、O 无水；翻 V2 后 O 有水
+const closedObsNet = {
+  nodes: ['S', 'X', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'X', open: true },
+    { id: 'V2', from: 'X', to: 'O', open: false },
+  ],
+};
+const o5 = solver.planSingleValveObservers(closedObsNet, { supplies: ['S'], candidates: ['O'] });
+check('baseline 与翻 V1 同组（O 均无水），翻 V2 另成一组', o5.groups.length === 2);
+const o5flipV2 = o5.groups.find((g) => g.hypotheses.some((h) => h.flippedValve === 'V2'));
+check('翻 V2 假设记录 关→开', o5flipV2.hypotheses[0].registeredOpen === false &&
+  o5flipV2.hypotheses[0].actualOpen === true);
+check('翻 V2 组在 O 点预期有水', o5flipV2.signature[0] === true);
+
+console.log('观测点规划：无阀管段直连时阀门翻转不影响签名：');
+const pipeObsNet = {
+  nodes: ['S', 'O'],
+  pipes: [{ id: 'P1', from: 'S', to: 'O' }],
+  valvedPipes: [{ id: 'V1', from: 'S', to: 'O', open: true }],
+};
+const o6 = solver.planSingleValveObservers(pipeObsNet, { supplies: ['S'], candidates: ['O'] });
+check('无阀管直连：各假设在 O 点恒有水，全部同组', o6.status === 'ok' &&
+  o6.distinguishable === false && o6.groups[0].signature[0] === true);
+
+console.log('观测点规划：校验与纯函数：');
+const oe1 = solver.planSingleValveObservers(network, { supplies: ['NOPE'], candidates: ['B'] });
+check('供水点不存在时报错', oe1.status === 'invalid');
+const oe2 = solver.planSingleValveObservers(network, { supplies: ['S1'], candidates: ['NOPE'] });
+check('候选节点不存在时报错', oe2.status === 'invalid');
+const oe3 = solver.planSingleValveObservers(network, { supplies: ['S1'], candidates: [] });
+check('候选节点为空时报错', oe3.status === 'invalid');
+const oe4 = solver.planSingleValveObservers(network, { supplies: [], candidates: ['B'] });
+check('缺少供水点时报错', oe4.status === 'invalid');
+const manyNodeNet = {
+  nodes: Array.from({ length: 13 }, (_, i) => `n${i}`),
+  pipes: [],
+  valvedPipes: [{ id: 'V1', from: 'n0', to: 'n1', open: true }],
+};
+const oe5 = solver.planSingleValveObservers(manyNodeNet, {
+  supplies: ['n0'],
+  candidates: manyNodeNet.nodes,
+});
+check('候选超过 12 个时报错（节点均存在）', oe5.status === 'invalid' && oe5.errors.some((e) => e.includes('12')));
+const o7 = solver.planSingleValveObservers(network, { supplies: ['S1', 'S2'], candidates: ['B', 'B', 'C'] });
+check('候选节点重复时去重不报错', o7.status === 'ok' && o7.candidates.join(',') === 'B,C');
+const beforeObs = JSON.stringify(network);
+solver.planSingleValveObservers(network, { supplies: ['S1', 'S2'], candidates: ['A', 'B', 'C', 'D'] });
+check('观测点规划不修改输入网络', JSON.stringify(network) === beforeObs);
+// 无阀网络（零阀门）：只有登记状态一个假设，天然同组
+const noValveNet = { nodes: ['S', 'O'], pipes: [{ id: 'P1', from: 'S', to: 'O' }], valvedPipes: [] };
+const o8 = solver.planSingleValveObservers(noValveNet, { supplies: ['S'], candidates: ['O'] });
+check('无阀门时仅 1 个假设且标记不可区分', o8.status === 'ok' &&
+  o8.hypothesisCount === 1 && o8.distinguishable === false);
+
 console.log(`\n${passed} 通过, ${failed} 失败`);
 process.exit(failed > 0 ? 1 : 0);

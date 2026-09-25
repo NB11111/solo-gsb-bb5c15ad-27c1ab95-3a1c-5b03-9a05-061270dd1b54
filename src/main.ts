@@ -7,13 +7,16 @@ import {
   verifyPriorityCapacity,
   suggestExpansion,
   locateValveAnomalies,
+  planSingleValveObservers,
   MAX_OPEN_VALVES,
   EXPANSION_TARGET_CAPACITY,
   MAX_EXPANSION_PIPES,
   MAX_FLIPS,
+  MAX_OBSERVER_CANDIDATES,
   type Query,
   type CapacityQuery,
   type AnomalyQuery,
+  type ObserverQuery,
   type SolveResult,
   type ResilienceResult,
   type CapacityResult,
@@ -22,6 +25,8 @@ import {
   type ExpansionPlan,
   type AnomalyResult,
   type AnomalySolution,
+  type ObserverPlanResult,
+  type ObserverHypothesis,
 } from './solver';
 import {
   SAMPLE_NETWORK,
@@ -31,6 +36,7 @@ import {
   SAMPLE_PRIORITY_OUTLETS,
   SAMPLE_WET_NODES,
   SAMPLE_DRY_NODES,
+  SAMPLE_OBSERVER_CANDIDATES,
 } from './sample';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -44,7 +50,9 @@ app.innerHTML = `
       还可做「供水能力核验」（按供给上限与出口需求量求总供给最大分配、缺口与限制总供给的最小割），
       可将部分保供出口标为「重点」做「重点出口优先配水」（先让重点出口总获配最大，再在此前提下让全部出口总获配最大），
       并能给出「管段增容建议」（在当前阀门状态下枚举将参与输水管段容量由 1 提至 2 的改造方案，最多改造两条）。
-      还可根据现场有水 / 无水观测做「阀门状态异常定位」（以登记的阀门开闭状态为基线，枚举最多 ${MAX_FLIPS} 处状态翻转来解释全部观测）。
+      还可根据现场有水 / 无水观测做「阀门状态异常定位」（以登记的阀门开闭状态为基线，枚举最多 ${MAX_FLIPS} 处状态翻转来解释全部观测），
+      并能做「单阀异常观测点规划」（把登记状态与每个阀门单独翻转作为假设，按候选观测节点的有水 / 无水签名归并不可区分组，
+      并搜索能区分任意两组的最少观测点集合，最多填 ${MAX_OBSERVER_CANDIDATES} 个候选节点）。
       组合搜索最多覆盖 ${MAX_OPEN_VALVES} 个当前开启的阀门；求解过程不修改输入中的阀门状态。
     </p>
   </header>
@@ -123,6 +131,22 @@ app.innerHTML = `
       <div class="button-row">
         <button id="locate-anomaly" type="button" class="secondary">定位异常阀门</button>
       </div>
+      <h2>5. 单阀异常观测点规划</h2>
+      <p class="hint">
+        沿用上方拓扑与供水点：填写<strong>最多 ${MAX_OBSERVER_CANDIDATES} 个候选观测节点</strong>，
+        把「登记状态」与「每个阀门单独翻转」分别作为假设，按各候选节点能否连通任一供水点生成<strong>有水 / 无水签名</strong>。
+        签名相同的假设归为<strong>不可区分组</strong>并列出；再搜索能区分任意两组的<strong>最少观测点集合</strong>
+        （同数时按节点名称升序列表的字典序推荐），并展示各组在推荐点的预期状态。求解不改拓扑。
+      </p>
+      <div class="fields">
+        <label>
+          候选观测节点（多个用逗号分隔，最多 ${MAX_OBSERVER_CANDIDATES} 个）
+          <input id="observer-candidates" type="text" placeholder="如：展厅A, 展厅B, 卫生间" />
+        </label>
+      </div>
+      <div class="button-row">
+        <button id="plan-observers" type="button" class="secondary">规划观测点</button>
+      </div>
     </section>
     <div class="side-column">
       <section class="panel result-panel">
@@ -175,6 +199,16 @@ app.innerHTML = `
           </p>
         </div>
       </section>
+      <section class="panel result-panel">
+        <h2>单阀异常观测点规划</h2>
+        <div id="observer-result">
+          <p class="hint">
+            在左侧填写候选观测节点后点击「规划观测点」，这里列出登记状态与每个阀门单独翻转等假设的
+            不可区分分组，给出能区分任意两组的最少观测点集合（同数按节点名称升序列表字典序推荐），
+            并展示各组在推荐点的预期有水 / 无水状态；全部假设同组时说明无法靠这些节点区分。
+          </p>
+        </div>
+      </section>
     </div>
   </main>
 `;
@@ -191,6 +225,7 @@ const leakEl = el<HTMLInputElement>('#leak');
 const outletsEl = el<HTMLInputElement>('#outlets');
 const wetNodesEl = el<HTMLInputElement>('#wet-nodes');
 const dryNodesEl = el<HTMLInputElement>('#dry-nodes');
+const observerCandidatesEl = el<HTMLInputElement>('#observer-candidates');
 const resultEl = el<HTMLDivElement>('#result');
 const inspectResultEl = el<HTMLDivElement>('#inspect-result');
 const capacityFormEl = el<HTMLDivElement>('#capacity-form');
@@ -198,6 +233,7 @@ const capacityResultEl = el<HTMLDivElement>('#capacity-result');
 const priorityResultEl = el<HTMLDivElement>('#priority-result');
 const expansionResultEl = el<HTMLDivElement>('#expansion-result');
 const anomalyResultEl = el<HTMLDivElement>('#anomaly-result');
+const observerResultEl = el<HTMLDivElement>('#observer-result');
 
 /** 已生成填写表对应的供水点 / 保供出口。 */
 interface CapacityFormState {
@@ -759,6 +795,128 @@ function renderAnomaly(result: AnomalyResult): void {
     ${result.truncated ? '<p class="hint">匹配方案过多，仅展示前 100 个。</p>' : ''}`;
 }
 
+/** 假设的文字描述：登记状态 / 某阀门单独翻转（登记→实际）。 */
+function observerHypothesisText(h: ObserverHypothesis): string {
+  if (h.kind === 'baseline') return '登记状态（零翻转）';
+  const from = h.registeredOpen ? '开' : '关';
+  const to = h.actualOpen ? '开' : '关';
+  return `翻转 ${h.flippedValve}（${from}→${to}）`;
+}
+
+function renderObserverPlan(result: ObserverPlanResult): void {
+  if (result.status === 'invalid') {
+    renderErrors(observerResultEl, '输入有误，无法规划：', result.errors);
+    return;
+  }
+
+  const stateTag = (wet: boolean): string =>
+    wet ? '<span class="tag tag-ok">有水</span>' : '<span class="tag tag-cut">无水</span>';
+  const stateText = (wet: boolean): string => (wet ? '有水' : '无水');
+
+  // 不可区分组表：组编号 / 组内假设 / 各候选点签名（推荐点加标记）
+  const recommendedSet = new Set(result.recommendedPoints ?? []);
+  const headerCells = result.candidates
+    .map(
+      (c) =>
+        `<th${recommendedSet.has(c) ? ' class="recommended-col"' : ''}>${escapeHtml(c)}${
+          recommendedSet.has(c) ? ' <span class="tag tag-pipe">推荐</span>' : ''
+        }</th>`
+    )
+    .join('');
+  const groupRows = result.groups
+    .map((g, gi) => {
+      const sigCells = g.signature
+        .map(
+          (wet, ci) =>
+            `<td class="${recommendedSet.has(result.candidates[ci]) ? 'recommended-col' : ''}">${stateTag(wet)}</td>`
+        )
+        .join('');
+      const hypList = g.hypotheses
+        .map((h) => {
+          const text = observerHypothesisText(h);
+          return h.kind === 'baseline'
+            ? `<li><strong>${escapeHtml(text)}</strong></li>`
+            : `<li>${escapeHtml(text)}</li>`;
+        })
+        .join('');
+      return `
+        <tr>
+          <td class="num"><strong>${gi + 1}</strong></td>
+          <td><ul class="hyp-list">${hypList}</ul></td>
+          ${sigCells}
+        </tr>`;
+    })
+    .join('');
+
+  if (!result.distinguishable) {
+    observerResultEl.innerHTML = `
+      <div class="banner warn">
+        无法靠这些候选节点区分：${result.hypothesisCount} 个假设（登记状态 + 每个阀门单独翻转）
+        在 ${result.candidates.length} 个候选节点上的有水 / 无水签名<strong>完全相同</strong>，
+        全部归为 1 个不可区分组——仅观测这些节点无法判断是登记状态还是哪个阀门异常，
+        请增设在不同假设下通水状态有差异的节点后再规划。
+      </div>
+      <p class="hint">
+        参与枚举的阀门数：${result.valveCount}（开、关状态均可被单独翻转）；
+        候选节点：${result.candidates.map((c) => `<code>${escapeHtml(c)}</code>`).join('、')}；
+        求解不修改拓扑与登记的阀门状态。
+      </p>
+      <table>
+        <thead>
+          <tr><th>组</th><th>组内假设（不可区分）</th>${headerCells}</tr>
+        </thead>
+        <tbody>${groupRows}</tbody>
+      </table>`;
+    return;
+  }
+
+  const points = result.recommendedPoints!;
+  // 各组在推荐观测点上的预期状态表
+  const expectedHeader = points.map((p) => `<th>${escapeHtml(p)}</th>`).join('');
+  const expectedRows = result.groups
+    .map(
+      (g, gi) => `
+      <tr>
+        <td class="num"><strong>${gi + 1}</strong></td>
+        <td><ul class="hyp-list">${g.hypotheses.map((h) => `<li>${escapeHtml(observerHypothesisText(h))}</li>`).join('')}</ul></td>
+        ${g.expectedStates.map((wet) => `<td>${stateTag(wet)}</td>`).join('')}
+      </tr>`
+    )
+    .join('');
+
+  observerResultEl.innerHTML = `
+    <div class="banner success">
+      ${result.hypothesisCount} 个假设在 ${result.candidates.length} 个候选节点上归为
+      <strong>${result.groups.length}</strong> 个不可区分组；
+      最少只需 <strong>${result.pointCount}</strong> 个观测点即可区分任意两组。
+      推荐观测点（同数按节点名称升序列表字典序最小）：
+      ${points.map((p) => `<code>${escapeHtml(p)}</code>`).join('、')}
+    </div>
+    <p class="hint">
+      参与枚举的阀门数：${result.valveCount}（每个阀门单独翻转，开↔关）；假设总数 = 阀门数 + 1（含登记状态）。
+      到推荐观测点观测后，将各点实际有水 / 无水状态与下表对照，落在哪个状态组合即对应哪个不可区分组。
+      求解不修改拓扑与登记的阀门状态。
+    </p>
+    <h3>各组在推荐观测点的预期状态</h3>
+    <table>
+      <thead>
+        <tr><th>组</th><th>组内假设（不可区分）</th>${expectedHeader}</tr>
+      </thead>
+      <tbody>${expectedRows}</tbody>
+    </table>
+    <details>
+      <summary>全部候选节点上的有水 / 无水签名（${result.candidates.length} 个候选点，推荐点已标记）</summary>
+      <table>
+        <thead>
+          <tr><th>组</th><th>组内假设（不可区分）</th>${headerCells}</tr>
+        </thead>
+        <tbody>${groupRows}</tbody>
+      </table>
+      <p class="hint">同一列上标记相同（同为${stateText(true)}或同为${stateText(false)}）的两个组无法靠该节点区分；
+      推荐点集合保证任意两组在至少一个推荐点上的预期状态不同。</p>
+    </details>`;
+}
+
 function readNetwork(): import('./solver').Network {
   let raw: unknown;
   try {
@@ -890,6 +1048,20 @@ function runAnomaly(): void {
   }
 }
 
+function runObserverPlan(): void {
+  try {
+    const network = readNetwork();
+    // 观测点规划沿用上方「供水点」，不依赖漏点与保供出口；不改拓扑
+    const observerQuery: ObserverQuery = {
+      supplies: splitList(suppliesEl.value),
+      candidates: splitList(observerCandidatesEl.value),
+    };
+    renderObserverPlan(planSingleValveObservers(network, observerQuery));
+  } catch (e) {
+    renderErrors(observerResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+  }
+}
+
 el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   topologyEl.value = JSON.stringify(SAMPLE_NETWORK, null, 2);
   suppliesEl.value = SAMPLE_QUERY.supplies.join(', ');
@@ -897,6 +1069,7 @@ el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   outletsEl.value = SAMPLE_QUERY.outlets.join(', ');
   wetNodesEl.value = SAMPLE_WET_NODES.join(', ');
   dryNodesEl.value = SAMPLE_DRY_NODES.join(', ');
+  observerCandidatesEl.value = SAMPLE_OBSERVER_CANDIDATES.join(', ');
   buildCapacityForm(
     SAMPLE_QUERY.supplies,
     SAMPLE_QUERY.outlets,
@@ -910,6 +1083,7 @@ el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   runPriorityCapacity();
   runExpansion();
   runAnomaly();
+  runObserverPlan();
 });
 
 el<HTMLButtonElement>('#solve').addEventListener('click', run);
@@ -918,6 +1092,7 @@ el<HTMLButtonElement>('#verify-capacity').addEventListener('click', runCapacity)
 el<HTMLButtonElement>('#priority-capacity').addEventListener('click', runPriorityCapacity);
 el<HTMLButtonElement>('#suggest-expansion').addEventListener('click', runExpansion);
 el<HTMLButtonElement>('#locate-anomaly').addEventListener('click', runAnomaly);
+el<HTMLButtonElement>('#plan-observers').addEventListener('click', runObserverPlan);
 el<HTMLButtonElement>('#build-capacity-form').addEventListener('click', () => {
   try {
     readNetwork(); // 仅校验拓扑 JSON，核验不依赖漏点

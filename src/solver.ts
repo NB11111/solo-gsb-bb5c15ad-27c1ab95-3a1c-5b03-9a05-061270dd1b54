@@ -1522,3 +1522,252 @@ export function locateValveAnomalies(network: Network, query: AnomalyQuery): Ano
       '或考虑三处及以上阀门状态异常、无阀管段破损 / 堵塞等其他原因。',
   };
 }
+
+// ============ 单阀异常观测点规划 ============
+
+/** 候选观测节点数上限 */
+export const MAX_OBSERVER_CANDIDATES = 12;
+
+export interface ObserverQuery {
+  /** 供水点节点 */
+  supplies: string[];
+  /** 候选观测节点（去重后不得超过 MAX_OBSERVER_CANDIDATES 个） */
+  candidates: string[];
+}
+
+/** 一个待区分假设：登记状态（零翻转）或单个阀门单独翻转。 */
+export interface ObserverHypothesis {
+  /** 假设类型：登记状态（零翻转）/ 单个阀门单独翻转 */
+  kind: 'baseline' | 'single-flip';
+  /** single-flip 时为被翻转的阀门编号；baseline 时为 null */
+  flippedValve: string | null;
+  /** 该阀门登记（基线）开闭状态；baseline 时为 null */
+  registeredOpen: boolean | null;
+  /** 该假设下阀门的实际开闭状态；baseline 时为 null */
+  actualOpen: boolean | null;
+}
+
+/** 不可区分组：组内各假设在全部候选观测节点上的有水 / 无水签名完全相同。 */
+export interface ObserverGroup {
+  /** 组内全部假设（登记状态优先，其余按阀门编号升序） */
+  hypotheses: ObserverHypothesis[];
+  /** 该组在各候选节点（名称升序）上的有水 / 无水签名，true 表示有水（可达任一供水点） */
+  signature: boolean[];
+  /** 该组在推荐观测点上的预期状态，与推荐点一一对应 */
+  expectedStates: boolean[];
+}
+
+export interface ObserverPlanOk {
+  status: 'ok';
+  /** 参与枚举的阀门总数（全部带阀管段，开、关状态均可翻转） */
+  valveCount: number;
+  /** 假设总数（= 阀门数 + 1） */
+  hypothesisCount: number;
+  /** 候选观测节点（按名称升序） */
+  candidates: string[];
+  /** 按签名归并出的不可区分组（组按其首个假设的顺序排列） */
+  groups: ObserverGroup[];
+  /** 是否能仅靠这些候选节点区分任意两组（全部假设同组时为 false） */
+  distinguishable: boolean;
+  /** 能区分任意两组的最少观测点节点名称（名称升序）；不可区分时为 null */
+  recommendedPoints: string[] | null;
+  /** 推荐观测点个数；不可区分时为 0 */
+  pointCount: number;
+}
+
+export interface ObserverInvalid {
+  status: 'invalid';
+  errors: string[];
+}
+
+export type ObserverPlanResult = ObserverPlanOk | ObserverInvalid;
+
+/**
+ * 单阀异常观测点规划：沿用拓扑与供水点（不改拓扑），把「登记状态」与「每个阀门
+ * 单独翻转」分别作为一个假设（共阀门数 + 1 个），对每个候选观测节点按「无阀管段 +
+ * 实际开启的带阀管段」计算其能否连通任一供水点，得到该假设在该节点上的有水 / 无水签名。
+ *
+ * - 候选节点上签名完全相同的假设归为一个不可区分组并全部列出；
+ * - 对不同组搜索能区分任意两组的最少观测点集合：按观测点个数 k = 1, 2, … 枚举，
+ *   同数时按「节点名称升序列表」的字典序取首个；全部假设同组时判定无法靠这些节点区分；
+ * - 输出各组在推荐观测点上的预期有水 / 无水状态。
+ * 纯函数，不修改输入拓扑与登记的阀门状态。
+ */
+export function planSingleValveObservers(network: Network, query: ObserverQuery): ObserverPlanResult {
+  const errors: string[] = [];
+  const nodeSet = new Set(network.nodes);
+  if (query.supplies.length === 0) errors.push('至少需要指定一个供水点。');
+  for (const s of query.supplies) {
+    if (!nodeSet.has(s)) errors.push(`供水点「${s}」不在节点列表中。`);
+  }
+  if (!Array.isArray(query.candidates)) {
+    errors.push('候选观测节点必须是数组。');
+  }
+  const rawCandidates = Array.isArray(query.candidates) ? query.candidates : [];
+  for (const c of rawCandidates) {
+    if (typeof c !== 'string' || c.length === 0) {
+      errors.push('候选观测节点必须是非空字符串。');
+    } else if (!nodeSet.has(c)) {
+      errors.push(`候选观测节点「${c}」不在节点列表中。`);
+    }
+  }
+  if (errors.length > 0) return { status: 'invalid', errors };
+
+  const supplies = uniquePreservingOrder(query.supplies);
+  // 去重并按名称升序排列：签名列顺序与同数字典序取舍均以此顺序为准
+  const candidates = uniquePreservingOrder(rawCandidates).sort((a, b) =>
+    a.localeCompare(b, 'zh-Hans-CN')
+  );
+  if (candidates.length === 0) errors.push('请至少填写一个候选观测节点。');
+  if (candidates.length > MAX_OBSERVER_CANDIDATES) {
+    errors.push(
+      `候选观测节点有 ${candidates.length} 个，超过上限 ${MAX_OBSERVER_CANDIDATES} 个；请精简候选名单后再规划。`
+    );
+  }
+  if (errors.length > 0) return { status: 'invalid', errors };
+
+  const valveIds = network.valvedPipes.map((v) => v.id).sort();
+  const indexOf = new Map<string, number>();
+  network.nodes.forEach((node, i) => indexOf.set(node, i));
+  const candidateIdx = candidates.map((c) => indexOf.get(c)!);
+  const supplyIdx = new Set(supplies.map((s) => indexOf.get(s)!));
+
+  // 无阀管段邻接（与阀门状态无关，只需构建一次）；带阀管段按假设实际开闭加入
+  const baseAdj: number[][] = Array.from({ length: network.nodes.length }, () => []);
+  const addEdge = (adj: number[][], a: number, b: number): void => {
+    adj[a].push(b);
+    adj[b].push(a);
+  };
+  for (const p of network.pipes) {
+    if (p.from === p.to) continue; // 自环对连通无意义
+    addEdge(baseAdj, indexOf.get(p.from)!, indexOf.get(p.to)!);
+  }
+
+  /** 计算某阀门单独翻转（flippedId 为 null 表示登记状态）下各候选节点是否有水。 */
+  const signatureOf = (flippedId: string | null): boolean[] => {
+    const adj: number[][] = baseAdj.map((row) => [...row]);
+    for (const vp of network.valvedPipes) {
+      if (vp.from === vp.to) continue;
+      const actualOpen = flippedId !== null && vp.id === flippedId ? !vp.open : vp.open;
+      if (!actualOpen) continue;
+      addEdge(adj, indexOf.get(vp.from)!, indexOf.get(vp.to)!);
+    }
+    const seen = new Array<boolean>(network.nodes.length).fill(false);
+    const queue: number[] = [];
+    for (const s of supplyIdx) {
+      if (!seen[s]) {
+        seen[s] = true;
+        queue.push(s);
+      }
+    }
+    while (queue.length > 0) {
+      const cur = queue.shift()!;
+      for (const next of adj[cur]) {
+        if (!seen[next]) {
+          seen[next] = true;
+          queue.push(next);
+        }
+      }
+    }
+    return candidateIdx.map((ci) => seen[ci]);
+  };
+
+  // 假设顺序：登记状态优先，其后各阀门按编号升序单独翻转
+  const hypotheses: ObserverHypothesis[] = [
+    { kind: 'baseline', flippedValve: null, registeredOpen: null, actualOpen: null },
+    ...network.valvedPipes
+      .map((vp) => ({ id: vp.id, open: vp.open }))
+      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+      .map((v) => ({
+        kind: 'single-flip' as const,
+        flippedValve: v.id,
+        registeredOpen: v.open,
+        actualOpen: !v.open,
+      })),
+  ];
+  // 与 hypotheses 对齐的签名矩阵（每行一个假设）
+  const signatures: boolean[][] = [
+    signatureOf(null),
+    ...valveIds.map((id) => signatureOf(id)),
+  ];
+
+  // 按签名归并不可区分组（保持假设首次出现的顺序）
+  const groupKeyOf = (sig: boolean[]): string => sig.map((b) => (b ? '1' : '0')).join('');
+  const groupIndexByKey = new Map<string, number>();
+  const groups: { hypotheses: ObserverHypothesis[]; signature: boolean[] }[] = [];
+  signatures.forEach((sig, hi) => {
+    const key = groupKeyOf(sig);
+    const gi = groupIndexByKey.get(key);
+    if (gi === undefined) {
+      groupIndexByKey.set(key, groups.length);
+      groups.push({ hypotheses: [hypotheses[hi]], signature: sig });
+    } else {
+      groups[gi].hypotheses.push(hypotheses[hi]);
+    }
+  });
+
+  if (groups.length === 1) {
+    return {
+      status: 'ok',
+      valveCount: valveIds.length,
+      hypothesisCount: hypotheses.length,
+      candidates,
+      groups: [{ ...groups[0], expectedStates: [] }],
+      distinguishable: false,
+      recommendedPoints: null,
+      pointCount: 0,
+    };
+  }
+
+  /** 所选候选列能否区分任意两组：等价于每个组在这些列上的签名（位模式）两两不同。 */
+  const distinguishesAll = (chosen: number[]): boolean => {
+    const seenPatterns = new Set<number>();
+    for (const g of groups) {
+      let pattern = 0;
+      chosen.forEach((ci, bit) => {
+        if (g.signature[ci]) pattern |= 1 << bit;
+      });
+      if (seenPatterns.has(pattern)) return false;
+      seenPatterns.add(pattern);
+    }
+    return true;
+  };
+
+  // 按观测点个数 k = 1..m 枚举，同 k 下按候选下标升序（即节点名称升序列表）字典序生成，
+  // 首个可区分任意两组的集合即「点数最少 → 名称列表字典序最小」的推荐
+  const m = candidates.length;
+  let recommended: number[] | null = null;
+  for (let k = 1; k <= m && recommended === null; k++) {
+    const idx = Array.from({ length: k }, (_, i) => i);
+    while (true) {
+      if (distinguishesAll(idx)) {
+        recommended = [...idx];
+        break;
+      }
+      let i = k - 1;
+      while (i >= 0 && idx[i] === m - k + i) i--;
+      if (i < 0) break;
+      idx[i]++;
+      for (let j = i + 1; j < k; j++) idx[j] = idx[j - 1] + 1;
+    }
+  }
+
+  // 不同组在全部候选上签名必不相同，故全部候选一定可区分，recommended 不可能为 null
+  const recommendedIdx = recommended!;
+  const recommendedPoints = recommendedIdx.map((ci) => candidates[ci]);
+
+  return {
+    status: 'ok',
+    valveCount: valveIds.length,
+    hypothesisCount: hypotheses.length,
+    candidates,
+    groups: groups.map((g) => ({
+      hypotheses: g.hypotheses,
+      signature: g.signature,
+      expectedStates: recommendedIdx.map((ci) => g.signature[ci]),
+    })),
+    distinguishable: true,
+    recommendedPoints,
+    pointCount: recommendedPoints.length,
+  };
+}
