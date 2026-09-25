@@ -7,13 +7,16 @@ import {
   verifyPriorityCapacity,
   suggestExpansion,
   locateValveAnomalies,
+  planObservationPoints,
   MAX_OPEN_VALVES,
   EXPANSION_TARGET_CAPACITY,
   MAX_EXPANSION_PIPES,
   MAX_FLIPS,
+  MAX_OBSERVATION_CANDIDATES,
   type Query,
   type CapacityQuery,
   type AnomalyQuery,
+  type ObservationPlanQuery,
   type SolveResult,
   type ResilienceResult,
   type CapacityResult,
@@ -22,6 +25,7 @@ import {
   type ExpansionPlan,
   type AnomalyResult,
   type AnomalySolution,
+  type ObservationPlanResult,
 } from './solver';
 import {
   SAMPLE_NETWORK,
@@ -31,6 +35,7 @@ import {
   SAMPLE_PRIORITY_OUTLETS,
   SAMPLE_WET_NODES,
   SAMPLE_DRY_NODES,
+  SAMPLE_OBSERVATION_CANDIDATES,
 } from './sample';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -44,7 +49,8 @@ app.innerHTML = `
       还可做「供水能力核验」（按供给上限与出口需求量求总供给最大分配、缺口与限制总供给的最小割），
       可将部分保供出口标为「重点」做「重点出口优先配水」（先让重点出口总获配最大，再在此前提下让全部出口总获配最大），
       并能给出「管段增容建议」（在当前阀门状态下枚举将参与输水管段容量由 1 提至 2 的改造方案，最多改造两条）。
-      还可根据现场有水 / 无水观测做「阀门状态异常定位」（以登记的阀门开闭状态为基线，枚举最多 ${MAX_FLIPS} 处状态翻转来解释全部观测）。
+      还可根据现场有水 / 无水观测做「阀门状态异常定位」（以登记的阀门开闭状态为基线，枚举最多 ${MAX_FLIPS} 处状态翻转来解释全部观测），
+      并能做「单阀异常观测点规划」（把登记状态与每个阀门单独翻转作为假设，按候选观测节点的有水 / 无水签名划分不可区分组，推荐能区分各组的最少观测点，最多 ${MAX_OBSERVATION_CANDIDATES} 个候选节点）。
       组合搜索最多覆盖 ${MAX_OPEN_VALVES} 个当前开启的阀门；求解过程不修改输入中的阀门状态。
     </p>
   </header>
@@ -123,6 +129,22 @@ app.innerHTML = `
       <div class="button-row">
         <button id="locate-anomaly" type="button" class="secondary">定位异常阀门</button>
       </div>
+      <h3>单阀异常观测点规划</h3>
+      <p class="hint">
+        沿用上方拓扑与供水点：填写最多 <strong>${MAX_OBSERVATION_CANDIDATES}</strong> 个候选观测节点，把「登记状态」与
+        「每个阀门单独翻转」（开↔关，已关阀也可被翻为开）各作为一个假设，按节点能否连通任一供水点生成
+        有水 / 无水签名；签名相同的假设归为不可区分组，并搜索能区分任意两组的<strong>最少观测点</strong>
+        （同数按节点名称升序列表的字典序推荐），展示各组在推荐点的预期状态。
+      </p>
+      <div class="fields">
+        <label>
+          候选观测节点（最多 ${MAX_OBSERVATION_CANDIDATES} 个，逗号分隔）
+          <input id="observation-candidates" type="text" placeholder="如：展厅A, 展厅B, 卫生间, 咖啡厅" />
+        </label>
+      </div>
+      <div class="button-row">
+        <button id="plan-observations" type="button" class="secondary">规划观测点</button>
+      </div>
     </section>
     <div class="side-column">
       <section class="panel result-panel">
@@ -175,6 +197,16 @@ app.innerHTML = `
           </p>
         </div>
       </section>
+      <section class="panel result-panel">
+        <h2>单阀异常观测点规划</h2>
+        <div id="observation-plan-result">
+          <p class="hint">
+            在左侧填写候选观测节点后点击「规划观测点」，这里列出每个假设（登记状态 / 单个阀门翻转）
+            在候选节点上的有水 / 无水签名、签名相同的不可区分组，并给出能区分任意两组的最少观测点
+            与各组在推荐点的预期状态。
+          </p>
+        </div>
+      </section>
     </div>
   </main>
 `;
@@ -191,6 +223,7 @@ const leakEl = el<HTMLInputElement>('#leak');
 const outletsEl = el<HTMLInputElement>('#outlets');
 const wetNodesEl = el<HTMLInputElement>('#wet-nodes');
 const dryNodesEl = el<HTMLInputElement>('#dry-nodes');
+const observationCandidatesEl = el<HTMLInputElement>('#observation-candidates');
 const resultEl = el<HTMLDivElement>('#result');
 const inspectResultEl = el<HTMLDivElement>('#inspect-result');
 const capacityFormEl = el<HTMLDivElement>('#capacity-form');
@@ -198,6 +231,7 @@ const capacityResultEl = el<HTMLDivElement>('#capacity-result');
 const priorityResultEl = el<HTMLDivElement>('#priority-result');
 const expansionResultEl = el<HTMLDivElement>('#expansion-result');
 const anomalyResultEl = el<HTMLDivElement>('#anomaly-result');
+const observationPlanResultEl = el<HTMLDivElement>('#observation-plan-result');
 
 /** 已生成填写表对应的供水点 / 保供出口。 */
 interface CapacityFormState {
@@ -759,6 +793,126 @@ function renderAnomaly(result: AnomalyResult): void {
     ${result.truncated ? '<p class="hint">匹配方案过多，仅展示前 100 个。</p>' : ''}`;
 }
 
+function renderObservationPlan(result: ObservationPlanResult): void {
+  if (result.status === 'invalid') {
+    renderErrors(observationPlanResultEl, '输入有误，无法规划：', result.errors);
+    return;
+  }
+
+  const wetTag = '<span class="tag tag-ok">有水</span>';
+  const dryTag = '<span class="tag tag-cut">无水</span>';
+
+  // 假设 -> 所属组编号（按组在 groups 中的顺序编号）
+  const groupOfKey = new Map<string, number>();
+  result.groups.forEach((g, gi) => {
+    for (const h of g.hypotheses) groupOfKey.set(h.key, gi + 1);
+  });
+
+  // 假设 × 候选节点签名表
+  const signatureRows = result.hypotheses
+    .map((h) => {
+      const gi = groupOfKey.get(h.key)!;
+      const sig = result.groups[gi - 1].signature;
+      return `
+        <tr>
+          <td>${h.baseline ? '<strong>登记状态</strong>' : `翻转 <code>${escapeHtml(h.flippedValve!)}</code>`}</td>
+          <td class="hint">${escapeHtml(h.baseline ? '（零翻转）' : `${h.registeredOpen ? '开' : '关'}→${h.actualOpen ? '开' : '关'}`)}</td>
+          ${sig.map((wet) => `<td class="num">${wet ? wetTag : dryTag}</td>`).join('')}
+          <td class="num"><span class="tag tag-kind">G${gi}</span></td>
+        </tr>`;
+    })
+    .join('');
+
+  // 不可区分组列表
+  const groupItems = result.groups
+    .map((g, gi) => {
+      const hypText = g.hypotheses
+        .map((h) => (h.baseline ? '<strong>登记状态</strong>' : `<code>${escapeHtml(h.flippedValve!)}</code>`))
+        .join('、');
+      const sigText = g.signature.map((wet) => (wet ? '有水' : '无水')).join(' / ');
+      return `
+        <li>
+          <span class="tag tag-kind">G${gi + 1}</span>
+          <strong>${g.hypotheses.length}</strong> 个不可区分假设：${hypText}
+          <span class="hint">（签名 ${escapeHtml(sigText)}）</span>
+        </li>`;
+    })
+    .join('');
+
+  // 推荐观测点与各组预期状态
+  let recommendation: string;
+  if (result.indistinguishable) {
+    recommendation = `
+      <div class="banner warn">
+        全部 <strong>${result.hypothesisCount}</strong> 个假设（登记状态 + ${result.valveCount} 个单阀翻转）
+        在这 ${result.candidates.length} 个候选节点上的有水 / 无水签名<strong>完全相同</strong>，
+        无法靠这些节点区分任何假设。请更换或增加候选观测节点（如更靠近各阀门管段的节点）。
+      </div>`;
+  } else {
+    const points = result.recommendedPoints.map((p) => `<code>${escapeHtml(p)}</code>`).join('、');
+    const expectedRows = result.groups
+      .map((g, gi) => {
+        const states = result.expectedStates[gi]
+          .map((wet) => `<td class="num">${wet ? wetTag : dryTag}</td>`)
+          .join('');
+        const headName = g.hypotheses[0].baseline
+          ? '登记状态'
+          : `翻转 ${g.hypotheses[0].flippedValve}${g.hypotheses.length > 1 ? ' 等' : ''}`;
+        return `
+          <tr>
+            <td><span class="tag tag-kind">G${gi + 1}</span></td>
+            <td class="hint">${headName === '登记状态' ? '<strong>登记状态</strong>' : escapeHtml(headName)}</td>
+            ${states}
+          </tr>`;
+      })
+      .join('');
+    recommendation = `
+      <div class="banner success">
+        共 <strong>${result.hypothesisCount}</strong> 个假设划分为 <strong>${result.groups.length}</strong> 个不可区分组；
+        区分任意两组最少需观测 <strong>${result.recommendedPoints.length}</strong> 个点：${points}
+        （同数方案中按节点名称升序列表字典序推荐）。
+      </div>
+      <table>
+        <thead>
+          <tr><th>组别</th><th>代表假设</th>${result.recommendedPoints
+            .map((p) => `<th>${escapeHtml(p)}</th>`)
+            .join('')}</tr>
+        </thead>
+        <tbody>${expectedRows}</tbody>
+      </table>
+      <p class="hint">表中为各组在推荐观测点的预期状态：现场读数落在哪一组的状态组合，异常即限定在该组假设内；同组假设仍需其他信息才能进一步区分。</p>`;
+  }
+
+  observationPlanResultEl.innerHTML = `
+    ${recommendation}
+    <h3>不可区分组（${result.groups.length} 组）</h3>
+    <ul class="cut-list">${groupItems}</ul>
+    <details open>
+      <summary>全部假设的候选节点签名（有水 = 可连通任一供水点）</summary>
+      <table>
+        <thead>
+          <tr>
+            <th>假设</th><th>翻转</th>
+            ${result.candidates.map((c) => `<th>${escapeHtml(c)}</th>`).join('')}
+            <th>所属组</th>
+          </tr>
+        </thead>
+        <tbody>${signatureRows}</tbody>
+      </table>
+    </details>
+    <p class="hint">
+      假设共 ${result.hypothesisCount} 个：登记状态 1 个 + 每个阀门单独翻转 ${result.valveCount} 个
+      （全部带阀管段，开、关状态均可翻转）；候选观测节点 ${result.candidates.length} 个。
+      ${
+        result.constantCandidates.length > 0
+          ? `其中 ${result.constantCandidates.map((c) => `「${escapeHtml(c)}」`).join('、')} 在全部假设下状态恒定` +
+            (result.indistinguishable ? '。' : '，不参与区分。')
+          : ''
+      }
+      规划仅为方案测算，不改写拓扑与登记的阀门开闭状态。
+    </p>`;
+}
+
 function readNetwork(): import('./solver').Network {
   let raw: unknown;
   try {
@@ -890,6 +1044,20 @@ function runAnomaly(): void {
   }
 }
 
+function runObservationPlan(): void {
+  try {
+    const network = readNetwork();
+    // 观测点规划沿用上方「供水点」，不依赖漏点与保供出口
+    const planQuery: ObservationPlanQuery = {
+      supplies: splitList(suppliesEl.value),
+      candidates: splitList(observationCandidatesEl.value),
+    };
+    renderObservationPlan(planObservationPoints(network, planQuery));
+  } catch (e) {
+    renderErrors(observationPlanResultEl, '拓扑校验失败：', (e as { topologyErrors: string[] }).topologyErrors);
+  }
+}
+
 el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   topologyEl.value = JSON.stringify(SAMPLE_NETWORK, null, 2);
   suppliesEl.value = SAMPLE_QUERY.supplies.join(', ');
@@ -897,6 +1065,7 @@ el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   outletsEl.value = SAMPLE_QUERY.outlets.join(', ');
   wetNodesEl.value = SAMPLE_WET_NODES.join(', ');
   dryNodesEl.value = SAMPLE_DRY_NODES.join(', ');
+  observationCandidatesEl.value = SAMPLE_OBSERVATION_CANDIDATES.join(', ');
   buildCapacityForm(
     SAMPLE_QUERY.supplies,
     SAMPLE_QUERY.outlets,
@@ -910,6 +1079,7 @@ el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   runPriorityCapacity();
   runExpansion();
   runAnomaly();
+  runObservationPlan();
 });
 
 el<HTMLButtonElement>('#solve').addEventListener('click', run);
@@ -918,6 +1088,7 @@ el<HTMLButtonElement>('#verify-capacity').addEventListener('click', runCapacity)
 el<HTMLButtonElement>('#priority-capacity').addEventListener('click', runPriorityCapacity);
 el<HTMLButtonElement>('#suggest-expansion').addEventListener('click', runExpansion);
 el<HTMLButtonElement>('#locate-anomaly').addEventListener('click', runAnomaly);
+el<HTMLButtonElement>('#plan-observations').addEventListener('click', runObservationPlan);
 el<HTMLButtonElement>('#build-capacity-form').addEventListener('click', () => {
   try {
     readNetwork(); // 仅校验拓扑 JSON，核验不依赖漏点

@@ -63,3 +63,10 @@ export const SAMPLE_WET_NODES: string[] = ['咖啡厅', '卫生间'];
  * 登记状态中展厅B 经 V08 供水（应为有水），现场却无水 → 可定位为 V08 实际已关。
  */
 export const SAMPLE_DRY_NODES: string[] = ['展厅B'];
+
+/**
+ * 示例单阀异常观测点规划的候选观测节点（最多 12 个）。
+ * 各出口挂在环管不同位置：单翻转 V07 仅影响卫生间、V08/V09 影响展厅B，
+ * 而环上阀门（V03 等）翻转不改变这些出口的有水/无水状态，会与登记状态归为同组。
+ */
+export const SAMPLE_OBSERVATION_CANDIDATES: string[] = ['展厅A', '展厅B', '卫生间', '咖啡厅'];

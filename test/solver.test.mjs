@@ -704,5 +704,157 @@ const beforeAnom = JSON.stringify(network);
 solver.locateValveAnomalies(network, { supplies: ['S1', 'S2'], wetNodes: ['C'], dryNodes: ['B'] });
 check('异常定位不修改输入网络', JSON.stringify(network) === beforeAnom);
 
+// ============ 单阀异常观测点规划 ============
+console.log('单阀异常观测点规划：');
+
+const plan = (net, supplies, candidates) =>
+  solver.planObservationPoints(net, { supplies, candidates });
+
+// 主测试网络：A-P1-N2、C-P2-N3 为无阀管段；B 仅经开启阀 V08 挂在 N1（V09 已关）；
+// D 仅经 V07 挂在 N3；N1-N2-N3-N4 为环。单翻转 V08→B 无水、V07→D 无水，
+// 其余阀门翻转均不改变这四个出口的有水/无水状态。
+const op1 = plan(network, ['S1', 'S2'], ['B', 'C', 'D', 'A']);
+check('返回 ok', op1.status === 'ok');
+check('假设数 = 阀门数 + 1（登记 + 每个单翻转）', op1.hypothesisCount === 10 && op1.valveCount === 9);
+check('登记状态为首个假设', op1.hypotheses[0].baseline === true && op1.hypotheses[0].label === '登记状态');
+check('单翻转假设带开→关 / 关→开标注',
+  op1.hypotheses.find((h) => h.flippedValve === 'V08').actualOpen === false &&
+  op1.hypotheses.find((h) => h.flippedValve === 'V09').actualOpen === true);
+check('划分为 3 个不可区分组', op1.groups.length === 3);
+check('登记状态与环上阀门翻转同组（B,C,D,A 全有水）',
+  op1.groups[0].hypotheses.length === 8 &&
+  op1.groups[0].hypotheses.some((h) => h.baseline) &&
+  op1.groups[0].signature.join(',') === 'true,true,true,true');
+check('V08 单翻转为独立组（B 无水）',
+  op1.groups.some((g) => g.hypotheses.length === 1 && g.hypotheses[0].flippedValve === 'V08' &&
+    g.signature.join(',') === 'false,true,true,true'));
+check('V07 单翻转为独立组（D 无水）',
+  op1.groups.some((g) => g.hypotheses.length === 1 && g.hypotheses[0].flippedValve === 'V07' &&
+    g.signature.join(',') === 'true,true,false,true'));
+check('不是无法区分', op1.indistinguishable === false);
+check('最少观测点数为 2（B、D 两点组合）', op1.recommendedPoints.length === 2);
+check('推荐点为 B、D（名称升序）', op1.recommendedPoints.join(',') === 'B,D');
+check('各组在推荐点的预期状态矩阵与组顺序对应',
+  op1.expectedStates.length === 3 &&
+  op1.expectedStates.map((row) => row.map((w) => (w ? '1' : '0')).join('')).sort().join('|') === '01|10|11');
+check('恒定候选节点为 A、C（仅有无阀管段连接，恒有水）', op1.constantCandidates.join(',') === 'C,A');
+check('候选名单去重并保持输入顺序', op1.candidates.join(',') === 'B,C,D,A');
+
+console.log('观测点规划：单点即可区分时推荐单点：');
+// S—V1—X—V2—O：仅候选 O 一个出口。基线 O 有水；翻 V1 或 V2 均使 O 无水（二者同组）
+const planChainNet = {
+  nodes: ['S', 'X', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'X', open: true },
+    { id: 'V2', from: 'X', to: 'O', open: true },
+  ],
+};
+const op2 = plan(planChainNet, ['S'], ['O']);
+check('2 个组（登记 / 任一翻转）', op2.groups.length === 2);
+check('V1 与 V2 翻转同组（候选上签名相同）', op2.groups[1].hypotheses.map((h) => h.flippedValve).join(',') === 'V1,V2');
+check('最少观测点 1 个：O', op2.recommendedPoints.length === 1 && op2.recommendedPoints[0] === 'O');
+check('预期状态：登记有水、翻转组无水',
+  op2.expectedStates[0][0] === true && op2.expectedStates[1][0] === false);
+
+console.log('观测点规划：同数方案按节点名称升序列表字典序推荐：');
+// 3 个组在二元读数下至少需 2 个观测点；构造多个等价的两点集合验证字典序取舍：
+// S—V1—M—V2—T；A 经无阀管段挂在 M（V1 侧），O 经无阀管段挂在 T（V2 侧）。
+// 假设签名（候选 A,M,O,T）：登记 1111、翻 V1 0000、翻 V2 1100——
+// V1 侧点 A/M 模式相同、V2 侧点 O/T 模式相同，可区分的两点集合恰为
+// 「一个 V1 侧点 + 一个 V2 侧点」，共 4 个等优组合，字典序最小为 A、O。
+const tiePointNet = {
+  nodes: ['S', 'M', 'T', 'A', 'O'],
+  pipes: [
+    { id: 'P1', from: 'A', to: 'M' },
+    { id: 'P2', from: 'O', to: 'T' },
+  ],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'M', open: true },
+    { id: 'V2', from: 'M', to: 'T', open: true },
+  ],
+};
+const op3 = plan(tiePointNet, ['S'], ['M', 'T', 'A', 'O']);
+check('3 个组（登记 / 翻V1 / 翻V2）', op3.groups.length === 3);
+check('二元读数下单点无法区分三组，最少 2 个观测点', op3.recommendedPoints.length === 2);
+check('同数按名称升序列表字典序推荐 A、O（与输入顺序无关）', op3.recommendedPoints.join(',') === 'A,O');
+// 输入顺序打乱时推荐结果不变
+const op3b = plan(tiePointNet, ['S'], ['O', 'T', 'M', 'A']);
+check('输入顺序不影响字典序推荐', op3b.recommendedPoints.join(',') === 'A,O');
+check('主网络场景：最少点数优先（B、D 两点）', op1.recommendedPoints.join(',') === 'B,D');
+
+console.log('观测点规划：全部假设同组时明确无法区分：');
+// S—V1—X—V2—O：候选 X 位于两阀之间，翻任一阀都使 X 无水 → 登记与翻转不同组；
+// 但只选 X 且网络为单一串联阀时可构造全同组：S—V1—O，候选只有供水点 S（恒有水）
+const constNet = {
+  nodes: ['S', 'O'],
+  pipes: [],
+  valvedPipes: [{ id: 'V1', from: 'S', to: 'O', open: true }],
+};
+const op4 = plan(constNet, ['S'], ['S']);
+check('供水点作为候选：全部假设签名相同', op4.groups.length === 1 && op4.indistinguishable === true);
+check('无法区分时推荐点为空', Array.isArray(op4.recommendedPoints) && op4.recommendedPoints.length === 0);
+check('无法区分时预期状态矩阵为空', op4.expectedStates.length === 0);
+check('恒有水候选列入恒定候选', op4.constantCandidates.join(',') === 'S');
+// 加上 O 后即可区分（翻 V1 → O 无水）
+const op4b = plan(constNet, ['S'], ['S', 'O']);
+check('增加有效候选后可区分（推荐 O 单点）', op4b.indistinguishable === false &&
+  op4b.recommendedPoints.join(',') === 'O');
+check('供水点 S 标为恒定候选但不影响推荐', op4b.constantCandidates.join(',') === 'S');
+
+console.log('观测点规划：无阀管段直连使阀门翻转无观测影响：');
+// O 经无阀管段 P1 与 S 直连，V1 并联与否都不改变 O 的有水状态
+const noEffectNet = {
+  nodes: ['S', 'O'],
+  pipes: [{ id: 'P1', from: 'S', to: 'O' }],
+  valvedPipes: [{ id: 'V1', from: 'S', to: 'O', open: true }],
+};
+const op5 = plan(noEffectNet, ['S'], ['O']);
+check('翻转不改变签名时全部假设同组', op5.indistinguishable === true && op5.groups[0].hypotheses.length === 2);
+
+console.log('观测点规划：已关阀翻转为开也作为假设：');
+// O 仅经已关阀 V2 挂网：基线 O 无水，翻转 V2 后有水
+const closedPlanNet = {
+  nodes: ['S', 'X', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'X', open: true },
+    { id: 'V2', from: 'X', to: 'O', open: false },
+  ],
+};
+const op6 = plan(closedPlanNet, ['S'], ['X', 'O']);
+check('3 个假设（含已关阀翻转）', op6.hypothesisCount === 3);
+check('3 个组（翻V1: X,O 均无水；登记: X有水O无水；翻V2: 均有水）', op6.groups.length === 3);
+check('三组需两个观测点 X、O（单点无法区分三个组）', op6.recommendedPoints.join(',') === 'O,X');
+check('预期状态矩阵三行互不相同',
+  new Set(op6.expectedStates.map((row) => row.map((w) => (w ? '1' : '0')).join(''))).size === 3);
+const v2hyp = op6.hypotheses.find((h) => h.flippedValve === 'V2');
+check('V2 假设标注为关→开', v2hyp.registeredOpen === false && v2hyp.actualOpen === true);
+
+console.log('观测点规划：校验与纯函数：');
+const ope1 = plan(network, ['NOPE'], ['B']);
+check('供水点不存在时报错', ope1.status === 'invalid');
+const ope2 = plan(network, ['S1'], ['NOPE']);
+check('候选节点不存在时报错', ope2.status === 'invalid' && ope2.errors.some((e) => e.includes('候选观测节点')));
+const ope3 = plan(network, ['S1'], []);
+check('未填候选节点时报错', ope3.status === 'invalid');
+const ope4 = plan(network, [], ['B']);
+check('缺少供水点时报错', ope4.status === 'invalid');
+const limitNet = {
+  nodes: Array.from({ length: 14 }, (_, i) => `N${i}`),
+  pipes: [],
+  valvedPipes: [{ id: 'V1', from: 'N0', to: 'N1', open: true }],
+};
+const ope5 = plan(limitNet, ['N0'], Array.from({ length: 13 }, (_, i) => `N${i + 1}`));
+check('候选（去重后）超过 12 个时报错',
+  ope5.status === 'invalid' && ope5.errors.some((e) => e.includes('12')));
+const ope5b = plan(network, ['S1'], ['B', 'B', 'B']);
+check('候选重复去重后不报错', ope5b.status === 'ok' && ope5b.candidates.length === 1);
+const ope5c = plan(network, ['S1'], ['S1', 'S2', 'N1', 'N2', 'N3', 'N4', 'A', 'B', 'C', 'D']);
+check('10 个真实候选在上限内', ope5c.status === 'ok');
+const beforePlan = JSON.stringify(network);
+plan(network, ['S1', 'S2'], ['B', 'C', 'D', 'A']);
+check('观测点规划不修改输入网络', JSON.stringify(network) === beforePlan);
+
 console.log(`\n${passed} 通过, ${failed} 失败`);
 process.exit(failed > 0 ? 1 : 0);
